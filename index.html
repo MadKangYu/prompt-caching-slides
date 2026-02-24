@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lessons from Building Claude Code: Prompt Caching Is Everything</title>
+
+    <!-- JetBrains Mono from Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
+
+    <style>
+        /* ===========================================
+           CSS CUSTOM PROPERTIES — TERMINAL GREEN THEME
+           GitHub Dark + Terminal Green accent
+           =========================================== */
+        :root {
+            /* Colors */
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #484f58;
+            --accent: #39d353;
+            --accent-dim: rgba(57, 211, 83, 0.15);
+            --accent-glow: rgba(57, 211, 83, 0.4);
+            --accent-bright: #56d364;
+            --red: #f85149;
+            --yellow: #e3b341;
+            --blue: #58a6ff;
+            --border: #30363d;
+
+            /* Typography — ALL clamp() */
+            --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+            --title-size: clamp(1.8rem, 5vw, 4rem);
+            --h2-size: clamp(1.3rem, 3.5vw, 2.5rem);
+            --h3-size: clamp(1rem, 2.5vw, 1.5rem);
+            --body-size: clamp(0.7rem, 1.4vw, 1.05rem);
+            --small-size: clamp(0.6rem, 1vw, 0.85rem);
+            --code-size: clamp(0.65rem, 1.2vw, 0.95rem);
+
+            /* Spacing */
+            --slide-padding: clamp(1.5rem, 5vw, 5rem);
+            --content-gap: clamp(0.6rem, 2vw, 2rem);
+
+            /* Animation */
+            --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+            --duration: 0.6s;
+        }
+
+        /* ===========================================
+           RESET & BASE STYLES
+           =========================================== */
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+            scroll-snap-type: y mandatory;
+            height: 100%;
+            overflow-x: hidden;
+        }
+
+        body {
+            font-family: var(--font-mono);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            overflow-x: hidden;
+            height: 100%;
+            line-height: 1.5;
+        }
+
+        /* ===========================================
+           SLIDE CONTAINER
+           CRITICAL: Each slide = exact viewport height
+           overflow: hidden prevents ANY scrolling
+           =========================================== */
+        .slide {
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            padding: var(--slide-padding);
+            scroll-snap-align: start;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .slide-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            max-height: 100%;
+            overflow: hidden;
+            gap: var(--content-gap);
+        }
+
+        /* ===========================================
+           SCAN LINES OVERLAY
+           Signature Terminal Green CRT effect
+           =========================================== */
+        .slide::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0, 0, 0, 0.08) 2px,
+                rgba(0, 0, 0, 0.08) 4px
+            );
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        /* CRT vignette glow */
+        .slide::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(
+                ellipse at center,
+                transparent 60%,
+                rgba(0, 0, 0, 0.4) 100%
+            );
+            pointer-events: none;
+            z-index: 9;
+        }
+
+        /* ===========================================
+           TYPOGRAPHY
+           All sizes use clamp() for responsive scaling
+           =========================================== */
+        h1 {
+            font-size: var(--title-size);
+            font-weight: 700;
+            color: var(--accent);
+            line-height: 1.1;
+            text-shadow: 0 0 20px var(--accent-glow), 0 0 40px rgba(57, 211, 83, 0.15);
+        }
+
+        h2 {
+            font-size: var(--h2-size);
+            font-weight: 600;
+            color: var(--accent);
+            line-height: 1.2;
+            text-shadow: 0 0 10px var(--accent-glow);
+        }
+
+        h3 {
+            font-size: var(--h3-size);
+            font-weight: 500;
+            color: var(--accent-bright);
+        }
+
+        p, li {
+            font-size: var(--body-size);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .text-muted {
+            color: var(--text-secondary);
+        }
+
+        .text-accent {
+            color: var(--accent);
+        }
+
+        .text-red {
+            color: var(--red);
+        }
+
+        .text-yellow {
+            color: var(--yellow);
+        }
+
+        .text-blue {
+            color: var(--blue);
+        }
+
+        /* ===========================================
+           TERMINAL-STYLE COMPONENTS
+           =========================================== */
+
+        /* Prompt prefix */
+        .prompt::before {
+            content: '$ ';
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        /* Comment style */
+        .comment {
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        .comment::before {
+            content: '// ';
+            color: var(--text-muted);
+        }
+
+        /* Inline code */
+        code {
+            background: var(--bg-tertiary);
+            color: var(--accent-bright);
+            padding: 0.15em 0.4em;
+            border-radius: 4px;
+            font-size: 0.9em;
+            font-family: var(--font-mono);
+            border: 1px solid var(--border);
+        }
+
+        /* Code block */
+        .code-block {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: clamp(0.6rem, 1.5vw, 1.2rem);
+            font-size: var(--code-size);
+            line-height: 1.6;
+            overflow: hidden;
+        }
+
+        .code-block .line-num {
+            color: var(--text-muted);
+            user-select: none;
+            display: inline-block;
+            width: 2.5ch;
+            text-align: right;
+            margin-right: 1.5ch;
+        }
+
+        /* Bullet list */
+        .terminal-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: clamp(0.3rem, 1vh, 0.8rem);
+        }
+
+        .terminal-list li {
+            padding-left: 2ch;
+            position: relative;
+        }
+
+        .terminal-list li::before {
+            content: '>';
+            position: absolute;
+            left: 0;
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        /* Stack/architecture diagram */
+        .stack {
+            display: flex;
+            flex-direction: column;
+            gap: clamp(0.2rem, 0.5vh, 0.5rem);
+        }
+
+        .stack-item {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+            padding: clamp(0.4rem, 1vw, 0.8rem) clamp(0.6rem, 1.5vw, 1.2rem);
+            border-radius: 4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: var(--body-size);
+        }
+
+        .stack-item .label {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .stack-item .tag {
+            font-size: var(--small-size);
+            color: var(--text-secondary);
+            background: var(--bg-tertiary);
+            padding: 0.1em 0.6em;
+            border-radius: 3px;
+        }
+
+        .stack-item.highlight {
+            border-left-color: var(--yellow);
+            background: rgba(227, 179, 65, 0.05);
+        }
+
+        /* Comparison table */
+        .compare-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: clamp(0.5rem, 1.5vw, 1rem);
+        }
+
+        .compare-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: clamp(0.6rem, 1.5vw, 1.2rem);
+        }
+
+        .compare-card.bad {
+            border-color: var(--red);
+            border-left-width: 3px;
+        }
+
+        .compare-card.good {
+            border-color: var(--accent);
+            border-left-width: 3px;
+        }
+
+        .compare-card h3 {
+            margin-bottom: clamp(0.3rem, 0.5vh, 0.5rem);
+            font-size: var(--small-size);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        /* Price comparison */
+        .price-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: clamp(0.3rem, 0.8vw, 0.6rem) 0;
+            border-bottom: 1px solid var(--border);
+            font-size: var(--body-size);
+        }
+
+        .price-row:last-child {
+            border-bottom: none;
+        }
+
+        .price-row .price {
+            font-weight: 700;
+            font-size: clamp(0.8rem, 1.6vw, 1.15rem);
+        }
+
+        /* Blinking cursor */
+        .cursor {
+            display: inline-block;
+            width: 0.6em;
+            height: 1.1em;
+            background: var(--accent);
+            margin-left: 0.2em;
+            vertical-align: text-bottom;
+            animation: blink 1s step-end infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        /* Subtitle / author line */
+        .subtitle {
+            font-size: clamp(0.8rem, 1.8vw, 1.2rem);
+            color: var(--text-secondary);
+            font-weight: 300;
+        }
+
+        .author {
+            font-size: var(--small-size);
+            color: var(--text-muted);
+            margin-top: clamp(0.5rem, 1vh, 1rem);
+        }
+
+        /* Section number */
+        .section-num {
+            font-size: var(--small-size);
+            color: var(--text-muted);
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            margin-bottom: clamp(0.3rem, 0.5vh, 0.5rem);
+        }
+
+        /* Key insight box */
+        .insight-box {
+            background: var(--accent-dim);
+            border: 1px solid rgba(57, 211, 83, 0.3);
+            border-radius: 6px;
+            padding: clamp(0.5rem, 1.2vw, 1rem) clamp(0.8rem, 1.5vw, 1.2rem);
+            font-size: var(--body-size);
+            color: var(--accent-bright);
+        }
+
+        .insight-box::before {
+            content: '⚡ ';
+        }
+
+        /* SEV alert */
+        .sev-alert {
+            background: rgba(248, 81, 73, 0.1);
+            border: 1px solid rgba(248, 81, 73, 0.3);
+            border-radius: 6px;
+            padding: clamp(0.4rem, 1vw, 0.8rem) clamp(0.6rem, 1.2vw, 1rem);
+            color: var(--red);
+            font-size: var(--body-size);
+            font-weight: 500;
+        }
+
+        .sev-alert::before {
+            content: '🚨 ';
+        }
+
+        /* ===========================================
+           PROGRESS BAR
+           Fixed at top of viewport
+           =========================================== */
+        .progress-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: var(--accent);
+            box-shadow: 0 0 8px var(--accent-glow);
+            z-index: 100;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        /* ===========================================
+           NAVIGATION DOTS
+           Fixed right side
+           =========================================== */
+        .nav-dots {
+            position: fixed;
+            right: clamp(0.5rem, 1.5vw, 1.5rem);
+            top: 50%;
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            gap: clamp(0.3rem, 0.8vh, 0.6rem);
+            z-index: 100;
+        }
+
+        .nav-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            border: none;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            padding: 0;
+        }
+
+        .nav-dot:hover {
+            background: var(--text-secondary);
+            transform: scale(1.3);
+        }
+
+        .nav-dot.active {
+            background: var(--accent);
+            box-shadow: 0 0 6px var(--accent-glow);
+            transform: scale(1.2);
+        }
+
+        /* Keyboard hint */
+        .keyboard-hint {
+            position: fixed;
+            bottom: clamp(0.5rem, 1.5vh, 1.5rem);
+            right: clamp(0.5rem, 1.5vw, 1.5rem);
+            font-size: var(--small-size);
+            color: var(--text-muted);
+            z-index: 100;
+        }
+
+        .keyboard-hint kbd {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 0.1em 0.4em;
+            font-family: var(--font-mono);
+            font-size: 0.85em;
+        }
+
+        /* Slide number */
+        .slide-number {
+            position: absolute;
+            bottom: clamp(0.5rem, 1.5vh, 1.5rem);
+            left: clamp(1rem, 3vw, 2rem);
+            font-size: var(--small-size);
+            color: var(--text-muted);
+            z-index: 11;
+        }
+
+        /* ===========================================
+           ENTRANCE ANIMATIONS
+           Triggered by .visible class via IntersectionObserver
+           =========================================== */
+        .reveal {
+            opacity: 0;
+            transform: translateY(20px);
+            transition: opacity var(--duration) var(--ease-out-expo),
+                        transform var(--duration) var(--ease-out-expo);
+        }
+
+        .slide.visible .reveal {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        /* Staggered children */
+        .reveal:nth-child(1) { transition-delay: 0.05s; }
+        .reveal:nth-child(2) { transition-delay: 0.12s; }
+        .reveal:nth-child(3) { transition-delay: 0.19s; }
+        .reveal:nth-child(4) { transition-delay: 0.26s; }
+        .reveal:nth-child(5) { transition-delay: 0.33s; }
+        .reveal:nth-child(6) { transition-delay: 0.40s; }
+        .reveal:nth-child(7) { transition-delay: 0.47s; }
+
+        /* Type-in effect for code */
+        .type-in {
+            opacity: 0;
+            transition: opacity 0.4s ease;
+        }
+
+        .slide.visible .type-in {
+            opacity: 1;
+        }
+
+        /* ===========================================
+           RESPONSIVE BREAKPOINTS
+           Height-based for slide viewport fitting
+           =========================================== */
+
+        /* Short screens (< 700px height) */
+        @media (max-height: 700px) {
+            :root {
+                --slide-padding: clamp(1rem, 3vw, 2.5rem);
+                --content-gap: clamp(0.4rem, 1.5vw, 1rem);
+                --title-size: clamp(1.4rem, 4.5vw, 2.8rem);
+                --h2-size: clamp(1.1rem, 3vw, 1.8rem);
+            }
+        }
+
+        /* Very short (< 600px height) */
+        @media (max-height: 600px) {
+            :root {
+                --slide-padding: clamp(0.6rem, 2.5vw, 1.5rem);
+                --content-gap: clamp(0.3rem, 1vw, 0.7rem);
+                --title-size: clamp(1.2rem, 4vw, 2rem);
+                --body-size: clamp(0.65rem, 1.2vw, 0.9rem);
+            }
+
+            .nav-dots, .keyboard-hint {
+                display: none;
+            }
+        }
+
+        /* Extremely short — landscape phones (< 500px height) */
+        @media (max-height: 500px) {
+            :root {
+                --slide-padding: clamp(0.4rem, 2vw, 1rem);
+                --title-size: clamp(1rem, 3.5vw, 1.5rem);
+                --h2-size: clamp(0.9rem, 2.5vw, 1.25rem);
+                --body-size: clamp(0.6rem, 1vw, 0.8rem);
+            }
+        }
+
+        /* Narrow screens */
+        @media (max-width: 600px) {
+            :root {
+                --title-size: clamp(1.3rem, 7vw, 2.5rem);
+            }
+
+            .compare-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* ===========================================
+           REDUCED MOTION
+           Respect user preferences
+           =========================================== */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                transition-duration: 0.2s !important;
+            }
+
+            html {
+                scroll-behavior: auto;
+            }
+
+            .cursor {
+                animation: none;
+                opacity: 1;
+            }
+        }
+
+        /* ===========================================
+           SPECIFIC SLIDE STYLES
+           =========================================== */
+
+        /* Title slide - centered with glow */
+        .title-slide .slide-content {
+            align-items: center;
+            text-align: center;
+        }
+
+        .title-slide h1 {
+            text-shadow:
+                0 0 30px var(--accent-glow),
+                0 0 60px rgba(57, 211, 83, 0.1);
+        }
+
+        /* Grid pattern background for title */
+        .title-slide {
+            background:
+                linear-gradient(rgba(57, 211, 83, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(57, 211, 83, 0.03) 1px, transparent 1px),
+                var(--bg-primary);
+            background-size: 40px 40px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Progress bar -->
+    <div class="progress-bar" role="progressbar" aria-label="Presentation progress"></div>
+
+    <!-- Navigation dots -->
+    <nav class="nav-dots" aria-label="Slide navigation"></nav>
+
+    <!-- Keyboard hint -->
+    <div class="keyboard-hint" aria-hidden="true">
+        <kbd>↑</kbd> <kbd>↓</kbd> navigate
+    </div>
+
+    <!-- ==========================================
+         SLIDE 1: TITLE
+         ========================================== -->
+    <section class="slide title-slide" aria-label="Title slide">
+        <div class="slide-content">
+            <p class="reveal comment" style="font-size: var(--small-size);">// anthropic engineering · feb 2026</p>
+            <h1 class="reveal">
+                Lessons from Building<br>Claude Code<span class="cursor"></span>
+            </h1>
+            <p class="reveal subtitle">Prompt Caching Is Everything</p>
+            <p class="reveal author">Thariq Shafi · Claude Code Team @ Anthropic</p>
+        </div>
+        <div class="slide-number">01 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 2: THE CORE PROBLEM
+         ========================================== -->
+    <section class="slide" aria-label="The core problem">
+        <div class="slide-content">
+            <p class="reveal section-num">01 — the problem</p>
+            <h2 class="reveal">"Cache Rules Everything Around Me"</h2>
+            <ul class="reveal terminal-list">
+                <li>Long-running agentic products <strong class="text-accent">need caching to be feasible</strong></li>
+                <li>Reuses computation from previous roundtrips</li>
+                <li>Dramatically decreases <strong class="text-blue">latency</strong> AND <strong class="text-yellow">cost</strong></li>
+                <li>Claude Code is <em>built around</em> prompt caching from day one</li>
+            </ul>
+            <div class="reveal sev-alert">
+                We run alerts on cache hit rate and declare SEVs if they're too low
+            </div>
+        </div>
+        <div class="slide-number">02 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 3: HOW PREFIX MATCHING WORKS
+         ========================================== -->
+    <section class="slide" aria-label="How prefix matching works">
+        <div class="slide-content">
+            <p class="reveal section-num">02 — mechanics</p>
+            <h2 class="reveal">Prefix Matching</h2>
+            <ul class="reveal terminal-list">
+                <li>API caches from <code>start</code> → <code>cache_control</code> breakpoint</li>
+                <li>Generates cryptographic hash of prefix content</li>
+                <li class="text-red"><strong>ONE character difference kills the match</strong></li>
+                <li>Everything past the break → reprocessed at full price</li>
+            </ul>
+            <div class="reveal code-block">
+                <span class="text-muted"># The golden rule</span><br>
+                <span class="text-accent">cached_prefix</span> = <span class="text-yellow">hash(</span>request[<span class="text-blue">0</span> : <span class="text-blue">breakpoint</span>]<span class="text-yellow">)</span><br>
+                <span class="text-secondary">if</span> cached_prefix == previous_hash:<br>
+                &nbsp;&nbsp;&nbsp;&nbsp;<span class="text-accent">reuse_computation()</span> &nbsp;<span class="text-muted"># 10x cheaper</span><br>
+                <span class="text-secondary">else</span>:<br>
+                &nbsp;&nbsp;&nbsp;&nbsp;<span class="text-red">full_reprocess()</span> &nbsp;&nbsp;&nbsp;&nbsp;<span class="text-muted"># full price 💸</span>
+            </div>
+        </div>
+        <div class="slide-number">03 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 4: THE ARCHITECTURE
+         ========================================== -->
+    <section class="slide" aria-label="The architecture">
+        <div class="slide-content">
+            <p class="reveal section-num">03 — architecture</p>
+            <h2 class="reveal">Order Is Everything</h2>
+            <p class="reveal text-muted" style="font-size: var(--body-size);">Static first, dynamic last — maximize shared prefix</p>
+            <div class="reveal stack">
+                <div class="stack-item">
+                    <span class="label">1. Static System Prompt & Tools</span>
+                    <span class="tag" style="color: var(--accent);">globally cached</span>
+                </div>
+                <div class="stack-item">
+                    <span class="label">2. CLAUDE.MD</span>
+                    <span class="tag" style="color: var(--blue);">per project</span>
+                </div>
+                <div class="stack-item">
+                    <span class="label">3. Session Context</span>
+                    <span class="tag" style="color: var(--yellow);">per session</span>
+                </div>
+                <div class="stack-item highlight">
+                    <span class="label">4. Conversation Messages</span>
+                    <span class="tag" style="color: var(--red);">variable — never cached</span>
+                </div>
+            </div>
+            <div class="reveal insight-box">
+                "Surprisingly fragile" — a timestamp in the system prompt broke caching across the entire product
+            </div>
+        </div>
+        <div class="slide-number">04 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 5: SYSTEM MESSAGES
+         ========================================== -->
+    <section class="slide" aria-label="System messages">
+        <div class="slide-content">
+            <p class="reveal section-num">04 — lesson</p>
+            <h2 class="reveal">System Messages,<br>Not System Prompt</h2>
+            <div class="reveal compare-grid">
+                <div class="compare-card bad">
+                    <h3 class="text-red">✗ Don't</h3>
+                    <p>Update system prompt with new info (time, file changes)</p>
+                    <p class="text-muted" style="margin-top: 0.3em; font-size: var(--small-size);">→ Invalidates entire cache prefix</p>
+                </div>
+                <div class="compare-card good">
+                    <h3 class="text-accent">✓ Do</h3>
+                    <p>Send system message in next conversation turn</p>
+                    <p class="text-muted" style="margin-top: 0.3em; font-size: var(--small-size);">→ Cache prefix survives intact</p>
+                </div>
+            </div>
+            <div class="reveal code-block">
+                <span class="text-muted"># Instead of editing system prompt:</span><br>
+                <span class="text-secondary">messages</span>.append({<br>
+                &nbsp;&nbsp;<span class="text-blue">"role"</span>: <span class="text-yellow">"system"</span>,<br>
+                &nbsp;&nbsp;<span class="text-blue">"content"</span>: <span class="text-yellow">"It is now Wednesday"</span><br>
+                })
+            </div>
+        </div>
+        <div class="slide-number">05 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 6: DON'T SWITCH MODELS
+         ========================================== -->
+    <section class="slide" aria-label="Don't switch models">
+        <div class="slide-content">
+            <p class="reveal section-num">05 — lesson</p>
+            <h2 class="reveal">Don't Switch Models<br>Mid-Session</h2>
+            <ul class="reveal terminal-list">
+                <li>Prompt caches are <strong class="text-red">unique to each model</strong></li>
+                <li>100K tokens cached on Opus → switching to Haiku = full rebuild</li>
+                <li>Haiku would actually cost <strong>MORE</strong> than keeping Opus</li>
+            </ul>
+            <div class="reveal insight-box">
+                Solution: Use subagents with focused handoff messages — Claude Code's Explore agents use Haiku this way
+            </div>
+            <div class="reveal code-block">
+                <span class="text-muted"># Opus prepares handoff for Haiku subagent</span><br>
+                <span class="text-accent">opus</span>.handoff(<span class="text-yellow">"Summarize this function"</span>,<br>
+                &nbsp;&nbsp;model=<span class="text-blue">"haiku"</span>,<br>
+                &nbsp;&nbsp;context=<span class="text-yellow">"focused_subset"</span>)
+            </div>
+        </div>
+        <div class="slide-number">06 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 7: PLAN MODE
+         ========================================== -->
+    <section class="slide" aria-label="Plan mode">
+        <div class="slide-content">
+            <p class="reveal section-num">06 — design pattern</p>
+            <h2 class="reveal">Plan Mode — A Tool,<br>Not a Config Switch</h2>
+            <div class="reveal compare-grid">
+                <div class="compare-card bad">
+                    <h3 class="text-red">✗ Obvious approach</h3>
+                    <p>Swap to read-only toolset</p>
+                    <p class="text-red" style="font-size: var(--small-size); margin-top: 0.3em;">→ Cache break! 💥</p>
+                </div>
+                <div class="compare-card good">
+                    <h3 class="text-accent">✓ Claude Code's approach</h3>
+                    <p><code>EnterPlanMode</code> / <code>ExitPlanMode</code> are callable tools</p>
+                    <p class="text-accent" style="font-size: var(--small-size); margin-top: 0.3em;">→ Tool definitions never change</p>
+                </div>
+            </div>
+            <ul class="reveal terminal-list">
+                <li>System message tells model to restrict to read operations</li>
+                <li>Model can <strong class="text-accent">autonomously</strong> enter plan mode on hard problems</li>
+            </ul>
+        </div>
+        <div class="slide-number">07 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 8: TOOL SEARCH
+         ========================================== -->
+    <section class="slide" aria-label="Tool search">
+        <div class="slide-content">
+            <p class="reveal section-num">07 — design pattern</p>
+            <h2 class="reveal">Tool Search —<br>Defer, Don't Remove</h2>
+            <ul class="reveal terminal-list">
+                <li>MCP can load <strong>dozens of tools</strong> — expensive in prefix</li>
+                <li>Removing mid-conversation = <span class="text-red">cache break</span></li>
+                <li>Solution: lightweight stubs with <code>defer_loading: true</code></li>
+                <li>Same stubs, same order, every request</li>
+            </ul>
+            <div class="reveal code-block">
+                <span class="text-muted"># Stub in prefix (always present, never changes)</span><br>
+                {<span class="text-blue">"name"</span>: <span class="text-yellow">"mcp_database_query"</span>,<br>
+                &nbsp;<span class="text-blue">"defer_loading"</span>: <span class="text-accent">true</span>}<br><br>
+                <span class="text-muted"># Full schema loaded on-demand via ToolSearch</span><br>
+                <span class="text-accent">ToolSearch</span>(<span class="text-yellow">"database_query"</span>) → <span class="text-secondary">full schema</span>
+            </div>
+        </div>
+        <div class="slide-number">08 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 9: COMPACTION
+         ========================================== -->
+    <section class="slide" aria-label="Compaction">
+        <div class="slide-content">
+            <p class="reveal section-num">08 — design pattern</p>
+            <h2 class="reveal">Compaction —<br>Cache-Safe Forking</h2>
+            <div class="reveal compare-grid">
+                <div class="compare-card bad">
+                    <h3 class="text-red">✗ Naive implementation</h3>
+                    <p>Different system prompt, no tools → <strong>pays full price</strong> for entire history</p>
+                </div>
+                <div class="compare-card good">
+                    <h3 class="text-accent">✓ Cache-safe</h3>
+                    <p>Same prefix (prompt + tools + history) → append compaction as final message</p>
+                </div>
+            </div>
+            <ul class="reveal terminal-list">
+                <li>Request looks identical to parent's last request</li>
+                <li>Cache prefix <strong class="text-accent">fully reused</strong> — only new = compaction prompt</li>
+                <li>Now built into the API so you don't have to learn this</li>
+            </ul>
+        </div>
+        <div class="slide-number">09 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 10: THE COST MATH
+         ========================================== -->
+    <section class="slide" aria-label="Cost comparison">
+        <div class="slide-content">
+            <p class="reveal section-num">09 — economics</p>
+            <h2 class="reveal">The Cost Math</h2>
+            <div class="reveal" style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: clamp(0.5rem, 1.2vw, 1rem) clamp(0.8rem, 1.5vw, 1.2rem);">
+                <p class="text-muted" style="font-size: var(--small-size); margin-bottom: clamp(0.3rem, 0.5vh, 0.5rem);">Claude Sonnet — per million tokens</p>
+                <div class="price-row">
+                    <span>Uncached input</span>
+                    <span class="price text-red">$3.00</span>
+                </div>
+                <div class="price-row">
+                    <span>Cache write <span class="text-muted">(1.25×)</span></span>
+                    <span class="price text-yellow">$3.75</span>
+                </div>
+                <div class="price-row">
+                    <span>Cached read <span class="text-muted">(0.1×)</span></span>
+                    <span class="price text-accent">$0.30</span>
+                </div>
+            </div>
+            <div class="reveal compare-grid">
+                <div class="compare-card bad">
+                    <h3 class="text-red">Without cache</h3>
+                    <p style="font-size: var(--body-size);"><strong>$0.60</strong>/turn × 50 turns = <strong>$30.00</strong></p>
+                </div>
+                <div class="compare-card good">
+                    <h3 class="text-accent">With cache</h3>
+                    <p style="font-size: var(--body-size);"><strong>$0.06</strong>/turn × 50 turns = <strong>$3.60</strong></p>
+                </div>
+            </div>
+            <div class="reveal insight-box">
+                10× cost reduction — this is why cache hit rate determines whether the product can exist at its price
+            </div>
+        </div>
+        <div class="slide-number">10 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 11: MANUS CONFIRMS
+         ========================================== -->
+    <section class="slide" aria-label="Manus confirms">
+        <div class="slide-content">
+            <p class="reveal section-num">10 — independent validation</p>
+            <h2 class="reveal">Manus Confirms<br>Independently</h2>
+            <p class="reveal" style="font-size: var(--body-size); color: var(--text-secondary); font-style: italic;">
+                "KV-cache hit rate is the single most important metric for a production-stage AI agent"
+                <span style="color: var(--text-muted);"> — Peak Ji, Manus founder</span>
+            </p>
+            <ul class="reveal terminal-list">
+                <li><strong class="text-yellow">100:1</strong> input-to-output ratio → 99% cost in input processing</li>
+                <li>Rebuilt agent framework <strong class="text-red">4 times</strong> before getting caching right</li>
+                <li>Different approach: token logit masking + filesystem as context</li>
+                <li>Same rules: stable prefixes, append-only, no tool changes</li>
+            </ul>
+            <div class="reveal insight-box">Leave errors in context — they carry signal that prevents repeating mistakes</div>
+        </div>
+        <div class="slide-number">11 / 12</div>
+    </section>
+
+    <!-- ==========================================
+         SLIDE 12: KEY TAKEAWAYS
+         ========================================== -->
+    <section class="slide" aria-label="Key takeaways">
+        <div class="slide-content">
+            <p class="reveal section-num">// conclusion</p>
+            <h2 class="reveal">Key Takeaways<span class="cursor"></span></h2>
+            <div class="reveal code-block" style="border-color: var(--accent); border-left-width: 3px;">
+                <span class="text-muted"># Design your agent around these rules</span><br><br>
+                <span class="text-accent">1.</span> Design your entire system around <strong>prefix matching</strong><br>
+                <span class="text-accent">2.</span> Static first, dynamic last — <strong>order is everything</strong><br>
+                <span class="text-accent">3.</span> System messages > system prompt changes<br>
+                <span class="text-accent">4.</span> Never change <strong>tools or models</strong> mid-session<br>
+                <span class="text-accent">5.</span> Monitor cache hit rate like you monitor <strong>uptime</strong><br>
+                <span class="text-accent">6.</span> Fork operations must share the <strong>parent's prefix</strong>
+            </div>
+            <div class="reveal insight-box" style="text-align: center;">
+                "Claude Code is built around prompt caching from day one — you should do the same."
+            </div>
+        </div>
+        <div class="slide-number">12 / 12</div>
+    </section>
+
+    <script>
+        /* ===========================================
+           SLIDE PRESENTATION CONTROLLER
+           Handles navigation, animations, interactions
+           =========================================== */
+        class SlidePresentation {
+            constructor() {
+                this.slides = document.querySelectorAll('.slide');
+                this.currentSlide = 0;
+                this.isTransitioning = false;
+                this.touchStartY = 0;
+                this.touchEndY = 0;
+
+                this.progressBar = document.querySelector('.progress-bar');
+                this.navDotsContainer = document.querySelector('.nav-dots');
+
+                this.prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+                this.init();
+            }
+
+            init() {
+                this.createNavDots();
+                this.setupIntersectionObserver();
+                this.setupKeyboardNav();
+                this.setupWheelNav();
+                this.setupTouchNav();
+                this.updateProgress();
+                this.updateNavDots();
+
+                // Mark first slide visible
+                this.slides[0].classList.add('visible');
+            }
+
+            /* -------------------------------------------
+               Navigation Dots — generated from slide count
+               ------------------------------------------- */
+            createNavDots() {
+                this.slides.forEach((_, i) => {
+                    const dot = document.createElement('button');
+                    dot.classList.add('nav-dot');
+                    dot.setAttribute('aria-label', `Go to slide ${i + 1}`);
+                    dot.addEventListener('click', () => this.goToSlide(i));
+                    this.navDotsContainer.appendChild(dot);
+                });
+            }
+
+            /* -------------------------------------------
+               Intersection Observer — triggers .visible
+               for scroll-driven animations
+               ------------------------------------------- */
+            setupIntersectionObserver() {
+                const observer = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('visible');
+                            const index = Array.from(this.slides).indexOf(entry.target);
+                            if (index !== -1) {
+                                this.currentSlide = index;
+                                this.updateProgress();
+                                this.updateNavDots();
+                            }
+                        }
+                    });
+                }, {
+                    threshold: 0.5
+                });
+
+                this.slides.forEach(slide => observer.observe(slide));
+            }
+
+            /* -------------------------------------------
+               Keyboard Navigation
+               Arrows, Space, PageUp/Down, Home/End
+               ------------------------------------------- */
+            setupKeyboardNav() {
+                document.addEventListener('keydown', (e) => {
+                    switch (e.key) {
+                        case 'ArrowDown':
+                        case 'ArrowRight':
+                        case ' ':
+                        case 'PageDown':
+                            e.preventDefault();
+                            this.nextSlide();
+                            break;
+                        case 'ArrowUp':
+                        case 'ArrowLeft':
+                        case 'PageUp':
+                            e.preventDefault();
+                            this.prevSlide();
+                            break;
+                        case 'Home':
+                            e.preventDefault();
+                            this.goToSlide(0);
+                            break;
+                        case 'End':
+                            e.preventDefault();
+                            this.goToSlide(this.slides.length - 1);
+                            break;
+                    }
+                });
+            }
+
+            /* -------------------------------------------
+               Mouse Wheel Navigation
+               Debounced to prevent rapid fire
+               ------------------------------------------- */
+            setupWheelNav() {
+                let wheelTimeout;
+                document.addEventListener('wheel', (e) => {
+                    if (this.isTransitioning) return;
+
+                    clearTimeout(wheelTimeout);
+                    wheelTimeout = setTimeout(() => {
+                        if (e.deltaY > 50) {
+                            this.nextSlide();
+                        } else if (e.deltaY < -50) {
+                            this.prevSlide();
+                        }
+                    }, 50);
+                }, { passive: true });
+            }
+
+            /* -------------------------------------------
+               Touch/Swipe Navigation
+               Detect vertical swipes
+               ------------------------------------------- */
+            setupTouchNav() {
+                document.addEventListener('touchstart', (e) => {
+                    this.touchStartY = e.changedTouches[0].screenY;
+                }, { passive: true });
+
+                document.addEventListener('touchend', (e) => {
+                    this.touchEndY = e.changedTouches[0].screenY;
+                    const diff = this.touchStartY - this.touchEndY;
+
+                    if (Math.abs(diff) > 60) {
+                        if (diff > 0) {
+                            this.nextSlide();
+                        } else {
+                            this.prevSlide();
+                        }
+                    }
+                }, { passive: true });
+            }
+
+            /* -------------------------------------------
+               Slide Navigation Methods
+               ------------------------------------------- */
+            nextSlide() {
+                if (this.currentSlide < this.slides.length - 1) {
+                    this.goToSlide(this.currentSlide + 1);
+                }
+            }
+
+            prevSlide() {
+                if (this.currentSlide > 0) {
+                    this.goToSlide(this.currentSlide - 1);
+                }
+            }
+
+            goToSlide(index) {
+                if (this.isTransitioning || index === this.currentSlide) return;
+
+                this.isTransitioning = true;
+                this.currentSlide = index;
+
+                this.slides[index].scrollIntoView({
+                    behavior: this.prefersReducedMotion ? 'auto' : 'smooth'
+                });
+
+                this.updateProgress();
+                this.updateNavDots();
+
+                setTimeout(() => {
+                    this.isTransitioning = false;
+                }, 600);
+            }
+
+            /* -------------------------------------------
+               UI Updates — progress bar and nav dots
+               ------------------------------------------- */
+            updateProgress() {
+                const progress = ((this.currentSlide + 1) / this.slides.length) * 100;
+                this.progressBar.style.width = `${progress}%`;
+            }
+
+            updateNavDots() {
+                const dots = this.navDotsContainer.querySelectorAll('.nav-dot');
+                dots.forEach((dot, i) => {
+                    dot.classList.toggle('active', i === this.currentSlide);
+                });
+            }
+        }
+
+        /* ===========================================
+           INITIALIZE
+           =========================================== */
+        document.addEventListener('DOMContentLoaded', () => {
+            new SlidePresentation();
+        });
+    </script>
+</body>
+</html>
